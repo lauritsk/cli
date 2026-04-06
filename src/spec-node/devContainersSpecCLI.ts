@@ -45,7 +45,7 @@ import { featuresGenerateDocsHandler, featuresGenerateDocsOptions } from './feat
 import { templatesGenerateDocsHandler, templatesGenerateDocsOptions } from './templatesCLI/generateDocs';
 import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configuration/containerCollectionsOCI';
 import { templateMetadataHandler, templateMetadataOptions } from './templatesCLI/metadata';
-import { runBridgeHostFromConfig } from '../spec-bridge/bridge';
+import { runBridgeHostFromConfig, runBridgeSupervisorFromConfig } from '../spec-bridge/bridge';
 
 const defaultDefaultUserEnvProbe: UserEnvProbe = 'loginInteractiveShell';
 
@@ -56,13 +56,17 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 	const packageFolder = path.join(__dirname, '..', '..');
 	const version = getPackageConfig().version;
 	const argv = process.argv.slice(2);
-	if (argv[0] === 'bridge-host') {
+	if (argv[0] === 'bridge-host' || argv[0] === 'bridge-supervisor') {
 		const configIndex = argv.indexOf('--config');
 		const config = configIndex >= 0 ? argv[configIndex + 1] : undefined;
 		if (!config) {
-			throw new Error('bridge-host requires --config <path>');
+			throw new Error(`${argv[0]} requires --config <path>`);
 		}
-		await runBridgeHostFromConfig(path.resolve(process.cwd(), config));
+		if (argv[0] === 'bridge-host') {
+			await runBridgeHostFromConfig(path.resolve(process.cwd(), config));
+		} else {
+			await runBridgeSupervisorFromConfig(path.resolve(process.cwd(), config));
+		}
 		return;
 	}
 	const restArgs = argv[0] === 'exec' && argv[1] !== '--help'; // halt-at-non-option doesn't work in subcommands: https://github.com/yargs/yargs/issues/1417

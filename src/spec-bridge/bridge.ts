@@ -245,6 +245,21 @@ async function waitForBridge(port: number) {
 	throw new Error(`Timed out waiting for bridge on port ${port}`);
 }
 
+async function isContainerRunning(config: BridgeConfigFile) {
+	const result = await new Promise<{ code: number | null; stdout: string }>((resolve) => {
+		const child = spawn(config.dockerPath, ['inspect', '--type', 'container', '--format', '{{.State.Status}}', config.containerId], {
+			env: config.dockerEnv,
+			stdio: ['ignore', 'pipe', 'ignore'],
+		});
+		let stdout = '';
+		child.stdout?.setEncoding('utf8');
+		child.stdout?.on('data', chunk => stdout += chunk);
+		child.once('exit', code => resolve({ code, stdout }));
+		child.once('error', () => resolve({ code: 1, stdout }));
+	});
+	return result.code === 0 && result.stdout.trim() === 'running';
+}
+
 export async function startBridge(params: DockerResolverParameters, bridge: BridgeSession | undefined, containerId: string, containerHostname: string) {
 	if (!bridge) {
 		return;
@@ -265,7 +280,7 @@ export async function startBridge(params: DockerResolverParameters, bridge: Brid
 	await fs.promises.writeFile(bridge.configPath, JSON.stringify(config));
 
 	const cliEntry = path.join(params.common.extensionPath, 'devcontainer.js');
-	const child = spawn(process.execPath, [cliEntry, 'bridge-host', '--config', bridge.configPath], {
+	const child = spawn(process.execPath, [cliEntry, 'bridge-supervisor', '--config', bridge.configPath], {
 		cwd: params.common.cliHost.cwd,
 		detached: true,
 		stdio: 'ignore',
@@ -335,7 +350,6 @@ class BridgeHostService {
 	}
 
 	async run() {
-		await fs.promises.writeFile(this.config.pidPath, `${process.pid}`);
 		await new Promise<void>((resolve, reject) => {
 			this.controlServer.once('error', reject);
 			this.controlServer.listen(this.config.controlPort, '0.0.0.0', () => resolve());
@@ -493,7 +507,6 @@ class BridgeHostService {
 		}
 		this.forwarded.clear();
 		this.controlServer.close();
-		await fs.promises.rm(this.config.pidPath, { force: true });
 	}
 }
 
@@ -502,6 +515,54 @@ export async function runBridgeHostFromConfig(configPath: string) {
 	const service = new BridgeHostService(config);
 	await service.run();
 	await new Promise<void>(() => undefined);
+}
+
+export async function runBridgeSupervisorFromConfig(configPath: string) {
+	const config = await readConfig(configPath);
+	await fs.promises.writeFile(config.pidPath, `${process.pid}`);
+	let child: ReturnType<typeof spawn> | undefined;
+	let stopping = false;
+	const stopChild = () => {
+		if (child && !child.killed) {
+			child.kill('SIGTERM');
+		}
+	};
+	const shutdown = async () => {
+		if (stopping) {
+			return;
+		}
+		stopping = true;
+		stopChild();
+		await fs.promises.rm(config.pidPath, { force: true });
+		process.exit(0);
+	};
+	process.on('SIGTERM', () => void shutdown());
+	process.on('SIGINT', () => void shutdown());
+
+	while (!stopping) {
+		if (!(await isContainerRunning(config))) {
+			await shutdown();
+			return;
+		}
+		child = spawn(process.execPath, [process.argv[1], 'bridge-host', '--config', configPath], {
+			cwd: process.cwd(),
+			stdio: 'ignore',
+			env: process.env,
+		});
+		const exitCode = await new Promise<number | null>((resolve) => {
+			child!.once('exit', code => resolve(code));
+			child!.once('error', () => resolve(1));
+		});
+		child = undefined;
+		if (stopping) {
+			break;
+		}
+		if (!(await isContainerRunning(config))) {
+			await shutdown();
+			return;
+		}
+		await new Promise(resolve => setTimeout(resolve, exitCode === 0 ? 250 : 1000));
+	}
 }
 
 export function bridgeLabels(session: BridgeSession | undefined): string[] {
