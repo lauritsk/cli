@@ -27,6 +27,7 @@ describe('Internal bridge', () => {
 			port: 1234,
 			token: 'token',
 			configPath: '/tmp/config.json',
+			pidPath: '/tmp/bridge.pid',
 			hostMountPath: '/tmp/bridge',
 			containerMountPath: '/tmp/devcontainer-cli-bridge',
 		}), [

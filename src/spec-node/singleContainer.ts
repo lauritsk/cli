@@ -13,7 +13,7 @@ import { LogLevel, Log, makeLog } from '../spec-utils/log';
 import { extendImage, getExtendImageBuildInfo, updateRemoteUserUID } from './containerFeatures';
 import { getDevcontainerMetadata, getImageBuildInfoFromDockerfile, getImageMetadataFromContainer, ImageMetadataEntry, lifecycleCommandOriginMapFromMetadata, mergeConfiguration, MergedDevContainerConfig } from './imageMetadata';
 import { ensureDockerfileHasFinalStageName, generateMountCommand } from './dockerfileUtils';
-import { bridgeLabels, prepareBridge, startBridge, BridgeSession } from '../spec-bridge/bridge';
+import { bridgeLabels, prepareBridge, restoreBridge, startBridge, BridgeSession } from '../spec-bridge/bridge';
 
 export const hostFolderLabel = 'devcontainer.local_folder'; // used to label containers created from a workspace/folder
 export const configFileLabel = 'devcontainer.config_file';
@@ -32,6 +32,7 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 		let mergedConfig: MergedDevContainerConfig;
 		let bridge: BridgeSession | undefined;
 		if (container) {
+			bridge = await restoreBridge(params, container);
 			// let _collapsedFeatureConfig: Promise<CollapsedFeaturesConfig | undefined>;
 			// collapsedFeaturesConfig = async () => {
 			// 	return _collapsedFeatureConfig || (_collapsedFeatureConfig = (async () => {

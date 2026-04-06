@@ -19,6 +19,8 @@ import { LogLevel } from '../spec-utils/log';
 const bridgeFolderName = 'bridge';
 const containerBridgeRoot = '/tmp/devcontainer-cli-bridge';
 const containerBridgeBin = `${containerBridgeRoot}/bin`;
+const bridgeSessionLabel = 'devcontainer.bridge.session';
+const bridgeEnabledLabel = 'devcontainer.bridge.enabled';
 
 export interface BridgeSession {
 	sessionId: string;
@@ -26,6 +28,7 @@ export interface BridgeSession {
 	port: number;
 	token: string;
 	configPath: string;
+	pidPath: string;
 	hostMountPath: string;
 	containerMountPath: string;
 }
@@ -38,6 +41,8 @@ interface BridgeConfigFile {
 	token: string;
 	scanIntervalMs: number;
 	containerHostname: string;
+	sessionDir: string;
+	pidPath: string;
 }
 
 interface BridgePrepareResult {
@@ -134,6 +139,7 @@ export async function prepareBridge(params: DockerResolverParameters, mergedConf
 		port,
 		token,
 		configPath: path.join(sessionDir, 'bridge-config.json'),
+		pidPath: path.join(sessionDir, 'bridge.pid'),
 		hostMountPath: sessionDir,
 		containerMountPath: containerBridgeRoot,
 	};
@@ -161,10 +167,89 @@ export async function prepareBridge(params: DockerResolverParameters, mergedConf
 	};
 }
 
+function envListToObject(env: string[] | null | undefined): NodeJS.ProcessEnv {
+	return (env || []).reduce((acc, entry) => {
+		const index = entry.indexOf('=');
+		if (index >= 0) {
+			acc[entry.slice(0, index)] = entry.slice(index + 1);
+		}
+		return acc;
+	}, {} as NodeJS.ProcessEnv);
+}
+
+export async function restoreBridge(params: DockerResolverParameters, container: { Config: { Env: string[] | null; Labels: Record<string, string | undefined> | null; }; Mounts: { Source: string; Destination: string; }[]; }): Promise<BridgeSession | undefined> {
+	if (params.common.cliHost.platform !== 'darwin') {
+		return undefined;
+	}
+	const labels = container.Config.Labels || {};
+	if (labels[bridgeEnabledLabel] !== 'true') {
+		return undefined;
+	}
+	const env = envListToObject(container.Config.Env);
+	const sessionId = labels[bridgeSessionLabel];
+	const port = Number(env.DEVCONTAINER_BRIDGE_PORT || '0');
+	const token = env.DEVCONTAINER_BRIDGE_TOKEN;
+	const mount = container.Mounts.find(candidate => candidate.Destination === containerBridgeRoot);
+	if (!sessionId || !port || !token || !mount) {
+		return undefined;
+	}
+	await ensureDir(mount.Source);
+	await writeBridgeScripts(mount.Source);
+	return {
+		sessionId,
+		host: env.DEVCONTAINER_BRIDGE_HOST || 'host.docker.internal',
+		port,
+		token,
+		configPath: path.join(mount.Source, 'bridge-config.json'),
+		pidPath: path.join(mount.Source, 'bridge.pid'),
+		hostMountPath: mount.Source,
+		containerMountPath: containerBridgeRoot,
+	};
+}
+
+async function stopExistingBridge(bridge: BridgeSession) {
+	try {
+		const pidText = await fs.promises.readFile(bridge.pidPath, 'utf8');
+		const pid = Number(pidText.trim());
+		if (pid > 0) {
+			process.kill(pid, 'SIGTERM');
+			for (let attempt = 0; attempt < 20; attempt++) {
+				try {
+					process.kill(pid, 0);
+					await new Promise(resolve => setTimeout(resolve, 100));
+				} catch {
+					break;
+				}
+			}
+		}
+	} catch {
+		// Ignore missing pid files and already-stopped processes.
+	}
+}
+
+async function waitForBridge(port: number) {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		const ready = await new Promise<boolean>((resolve) => {
+			const socket = net.createConnection({ host: '127.0.0.1', port });
+			socket.once('connect', () => {
+				socket.destroy();
+				resolve(true);
+			});
+			socket.once('error', () => resolve(false));
+		});
+		if (ready) {
+			return;
+		}
+		await new Promise(resolve => setTimeout(resolve, 100));
+	}
+	throw new Error(`Timed out waiting for bridge on port ${port}`);
+}
+
 export async function startBridge(params: DockerResolverParameters, bridge: BridgeSession | undefined, containerId: string, containerHostname: string) {
 	if (!bridge) {
 		return;
 	}
+	await stopExistingBridge(bridge);
 
 	const config: BridgeConfigFile = {
 		dockerPath: params.dockerCLI,
@@ -174,6 +259,8 @@ export async function startBridge(params: DockerResolverParameters, bridge: Brid
 		token: bridge.token,
 		scanIntervalMs: 1500,
 		containerHostname,
+		sessionDir: bridge.hostMountPath,
+		pidPath: bridge.pidPath,
 	};
 	await fs.promises.writeFile(bridge.configPath, JSON.stringify(config));
 
@@ -185,6 +272,7 @@ export async function startBridge(params: DockerResolverParameters, bridge: Brid
 		env: process.env,
 	});
 	child.unref();
+	await waitForBridge(bridge.port);
 	params.common.output.write(`Started internal bridge for container ${containerId}.`, LogLevel.Trace);
 }
 
@@ -214,6 +302,20 @@ function connectorCommand(port: number) {
 }
 
 async function ensureOpen(url: string) {
+	const overrideCommand = process.env.DEVCONTAINER_BRIDGE_OPEN_COMMAND;
+	if (overrideCommand) {
+		return await new Promise<void>((resolve, reject) => {
+			const child = spawn('/bin/sh', ['-lc', overrideCommand], {
+				stdio: 'ignore',
+				env: {
+					...process.env,
+					DEVCONTAINER_BRIDGE_URL: url,
+				},
+			});
+			child.once('error', reject);
+			child.once('exit', code => code === 0 ? resolve() : reject(new Error(`open command exited with ${code}`)));
+		});
+	}
 	return await new Promise<void>((resolve, reject) => {
 		const child = spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], {
 			stdio: 'ignore',
@@ -233,6 +335,7 @@ class BridgeHostService {
 	}
 
 	async run() {
+		await fs.promises.writeFile(this.config.pidPath, `${process.pid}`);
 		await new Promise<void>((resolve, reject) => {
 			this.controlServer.once('error', reject);
 			this.controlServer.listen(this.config.controlPort, '0.0.0.0', () => resolve());
@@ -390,6 +493,7 @@ class BridgeHostService {
 		}
 		this.forwarded.clear();
 		this.controlServer.close();
+		await fs.promises.rm(this.config.pidPath, { force: true });
 	}
 }
 
@@ -405,8 +509,8 @@ export function bridgeLabels(session: BridgeSession | undefined): string[] {
 		return [];
 	}
 	return [
-		`devcontainer.bridge.session=${session.sessionId}`,
-		`devcontainer.bridge.enabled=true`,
+		`${bridgeSessionLabel}=${session.sessionId}`,
+		`${bridgeEnabledLabel}=true`,
 	];
 }
 

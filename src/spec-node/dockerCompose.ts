@@ -20,7 +20,7 @@ import path from 'path';
 import { getDevcontainerMetadata, getImageBuildInfoFromDockerfile, getImageBuildInfoFromImage, getImageMetadataFromContainer, ImageBuildInfo, lifecycleCommandOriginMapFromMetadata, mergeConfiguration, MergedDevContainerConfig } from './imageMetadata';
 import { ensureDockerfileHasFinalStageName } from './dockerfileUtils';
 import { randomUUID } from 'crypto';
-import { bridgeLabels, prepareBridge, startBridge, BridgeSession } from '../spec-bridge/bridge';
+import { bridgeLabels, prepareBridge, restoreBridge, startBridge, BridgeSession } from '../spec-bridge/bridge';
 
 const projectLabel = 'com.docker.compose.project';
 const serviceLabel = 'com.docker.compose.service';
@@ -52,6 +52,7 @@ async function _openDockerComposeDevContainer(params: DockerResolverParameters, 
 			throw new ContainerError({ description: 'The expected container does not exist.' });
 		}
 		container = containerId ? await inspectContainer(params, containerId) : undefined;
+		bridge = container ? await restoreBridge(params, container) : undefined;
 
 		if (container && (params.removeOnStartup === true || params.removeOnStartup === container.Id)) {
 			const text = 'Removing existing container.';
