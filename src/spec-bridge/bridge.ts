@@ -399,9 +399,10 @@ async function readConfig(configPath: string): Promise<BridgeConfigFile> {
 }
 
 function connectorCommand(port: number) {
-	const py = `import socket,sys,threading; s=socket.create_connection(("127.0.0.1",${port})); t=threading.Thread(target=lambda:(sys.stdout.buffer.write(s.makefile("rb",0).read()) or sys.stdout.flush()), daemon=True); t.start();\nwhile True:\n data=sys.stdin.buffer.read(65536)\n if not data: break\n s.sendall(data)\ns.shutdown(socket.SHUT_WR); t.join()`;
-	const bashTcp = `exec 3<>/dev/tcp/127.0.0.1/${port}; cat <&3 & cat >&3; wait`;
-	return `if command -v nc >/dev/null 2>&1; then exec nc 127.0.0.1 ${port}; elif command -v python3 >/dev/null 2>&1; then exec python3 -c ${shellQuote(py)}; elif command -v python >/dev/null 2>&1; then exec python -c ${shellQuote(py)}; elif command -v bash >/dev/null 2>&1; then exec bash -lc ${shellQuote(bashTcp)}; else echo bridge connector missing >&2; exit 127; fi`;
+	const py = `import base64, os, socket; s=socket.create_connection(("127.0.0.1",${port})); request=base64.b64decode(os.environ.get("DEVCONTAINER_BRIDGE_REQUEST_B64", ""))\ntry:\n if request:\n  s.sendall(request)\n try:\n  s.shutdown(socket.SHUT_WR)\n except Exception:\n  pass\n while True:\n  data=s.recv(65536)\n  if not data: break\n  os.write(1,data)\nfinally:\n s.close()`;
+	const perl = `use IO::Socket::INET; use MIME::Base64 qw(decode_base64); use Socket qw(SHUT_WR); binmode STDOUT; my $socket = IO::Socket::INET->new(PeerAddr => "127.0.0.1:${port}", Proto => "tcp") or die $!; my $request = decode_base64($ENV{DEVCONTAINER_BRIDGE_REQUEST_B64} // ''); print {$socket} $request or die $! if length($request); shutdown($socket, SHUT_WR); my $buffer = ''; while (read($socket, $buffer, 65536)) { print STDOUT $buffer or die $!; } close($socket);`;
+	const bashTcp = `exec 3<>/dev/tcp/127.0.0.1/${port}; cat >&3; exec 3>&-; cat <&3; exec 3<&-`;
+	return `if command -v python3 >/dev/null 2>&1; then exec python3 -c ${shellQuote(py)}; elif command -v python >/dev/null 2>&1; then exec python -c ${shellQuote(py)}; elif command -v perl >/dev/null 2>&1; then exec perl -e ${shellQuote(perl)}; elif command -v nc >/dev/null 2>&1; then exec nc 127.0.0.1 ${port}; elif command -v bash >/dev/null 2>&1; then exec bash -lc ${shellQuote(bashTcp)}; else echo bridge connector missing >&2; exit 127; fi`;
 }
 
 async function ensureOpen(url: string) {
@@ -583,25 +584,84 @@ class BridgeHostService {
 	}
 
 	private async handleSocket(port: number, socket: net.Socket) {
-		const child = spawn(this.config.dockerPath, ['exec', '-i', this.config.containerId, '/bin/sh', '-lc', connectorCommand(port)], {
-			env: this.config.dockerEnv,
-			stdio: ['pipe', 'pipe', 'pipe'],
-		});
-		if (!child.stdin || !child.stdout) {
+		try {
+			const request = await this.readHttpRequest(socket);
+			const response = await this.execRequestInContainer(port, request);
+			socket.end(response);
+		} catch {
 			socket.destroy();
-			child.kill();
-			return;
 		}
-		socket.pipe(child.stdin);
-		child.stdout.pipe(socket);
-		const close = () => {
-			socket.destroy();
-			child.kill();
-		};
-		socket.once('error', close);
-		socket.once('close', close);
-		child.once('error', close);
-		child.once('exit', () => socket.end());
+	}
+
+	private async readHttpRequest(socket: net.Socket) {
+		const maxBytes = 1024 * 1024;
+		return await new Promise<Buffer>((resolve, reject) => {
+			let timer: NodeJS.Timeout | undefined;
+			const chunks: Buffer[] = [];
+			let total = 0;
+			const cleanup = () => {
+				if (timer) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				socket.off('data', onData);
+				socket.off('end', onEnd);
+				socket.off('error', onError);
+			};
+			const finish = (value: Buffer) => {
+				cleanup();
+				resolve(value);
+			};
+			const fail = (err: Error) => {
+				cleanup();
+				reject(err);
+			};
+			const onError = (err: Error) => fail(err);
+			const onEnd = () => finish(Buffer.concat(chunks, total));
+			const onData = (chunk: Buffer) => {
+				chunks.push(chunk);
+				total += chunk.length;
+				if (total > maxBytes) {
+					fail(new Error('HTTP request too large'));
+					return;
+				}
+				const request = Buffer.concat(chunks, total);
+				const expectedLength = getHttpRequestLength(request);
+				if (expectedLength !== undefined && total >= expectedLength) {
+					finish(request.subarray(0, expectedLength));
+				}
+			};
+			timer = setTimeout(() => fail(new Error('Timed out reading forwarded HTTP request')), 15000);
+			socket.on('data', onData);
+			socket.once('end', onEnd);
+			socket.once('error', onError);
+		});
+	}
+
+	private async execRequestInContainer(port: number, request: Buffer) {
+		return await new Promise<Buffer>((resolve, reject) => {
+			const child = spawn(this.config.dockerPath, ['exec', '-e', `DEVCONTAINER_BRIDGE_REQUEST_B64=${request.toString('base64')}`, this.config.containerId, '/bin/sh', '-lc', connectorCommand(port)], {
+				env: this.config.dockerEnv,
+				stdio: ['ignore', 'pipe', 'pipe'],
+			});
+			if (!child.stdout || !child.stderr) {
+				child.kill();
+				reject(new Error('Failed to start bridge connector'));
+				return;
+			}
+			const stdoutChunks: Buffer[] = [];
+			const stderrChunks: Buffer[] = [];
+			child.stdout.on('data', chunk => stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+			child.stderr.on('data', chunk => stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+			child.once('error', reject);
+			child.once('exit', code => {
+				if (code === 0) {
+					resolve(Buffer.concat(stdoutChunks));
+					return;
+				}
+				reject(new Error(`Bridge connector exited with code ${code}: ${Buffer.concat(stderrChunks).toString('utf8')}`));
+			});
+		});
 	}
 
 	private async execInContainer(command: string) {
@@ -639,6 +699,21 @@ class BridgeHostService {
 			lastEvent: 'bridge host stopped',
 		});
 	}
+}
+
+function getHttpRequestLength(request: Buffer) {
+	const headerEnd = request.indexOf(Buffer.from('\r\n\r\n'));
+	if (headerEnd === -1) {
+		return undefined;
+	}
+	const headerText = request.subarray(0, headerEnd).toString('latin1');
+	const lines = headerText.split('\r\n');
+	if (!/^[A-Z]+\s+\S+\s+HTTP\/1\.[01]$/.test(lines[0])) {
+		return request.length;
+	}
+	const contentLengthHeader = lines.slice(1).find(line => /^content-length\s*:/i.test(line));
+	const contentLength = contentLengthHeader ? Number(contentLengthHeader.split(':')[1].trim()) : 0;
+	return Number.isFinite(contentLength) && contentLength >= 0 ? headerEnd + 4 + contentLength : headerEnd + 4;
 }
 
 export async function runBridgeHostFromConfig(configPath: string) {
