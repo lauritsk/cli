@@ -20,6 +20,7 @@ import path from 'path';
 import { getDevcontainerMetadata, getImageBuildInfoFromDockerfile, getImageBuildInfoFromImage, getImageMetadataFromContainer, ImageBuildInfo, lifecycleCommandOriginMapFromMetadata, mergeConfiguration, MergedDevContainerConfig } from './imageMetadata';
 import { ensureDockerfileHasFinalStageName } from './dockerfileUtils';
 import { randomUUID } from 'crypto';
+import { bridgeLabels, prepareBridge, startBridge, BridgeSession } from '../spec-bridge/bridge';
 
 const projectLabel = 'com.docker.compose.project';
 const serviceLabel = 'com.docker.compose.service';
@@ -38,6 +39,7 @@ async function _openDockerComposeDevContainer(params: DockerResolverParameters, 
 
 	let container: ContainerDetails | undefined;
 	let containerProperties: ContainerProperties | undefined;
+	let bridge: BridgeSession | undefined;
 	try {
 
 		const composeFiles = await getDockerComposeFilePaths(buildCLIHost, config, buildCLIHost.env, buildCLIHost.cwd);
@@ -63,6 +65,7 @@ async function _openDockerComposeDevContainer(params: DockerResolverParameters, 
 		if (!container || container.State.Status !== 'running') {
 			const res = await startContainer(params, buildParams, configWithRaw, projectName, composeFiles, envFile, composeConfig, container, idLabels, additionalFeatures);
 			container = await inspectContainer(params, res.containerId);
+			bridge = res.bridge;
 			// 	collapsedFeaturesConfig = res.collapsedFeaturesConfig;
 			// } else {
 			// 	const labels = container.Config.Labels || {};
@@ -73,6 +76,7 @@ async function _openDockerComposeDevContainer(params: DockerResolverParameters, 
 		const imageMetadata = getImageMetadataFromContainer(container, configWithRaw, undefined, idLabels, common.output).config;
 		const mergedConfig = mergeConfiguration(configWithRaw.config, imageMetadata);
 		containerProperties = await createContainerProperties(params, container.Id, remoteWorkspaceFolder, mergedConfig.remoteUser);
+		await startBridge(params, bridge, container.Id, container.Name);
 
 		const {
 			remoteEnv: extensionHostEnv,
@@ -360,6 +364,7 @@ async function startContainer(params: DockerResolverParameters, buildParams: Doc
 
 	const service = composeConfig.services[config.service];
 	const originalImageName = service.image || getDefaultImageName(await buildParams.dockerComposeCLI(), projectName, config.service);
+	let bridge: BridgeSession | undefined;
 
 	// Try to restore the 'third' docker-compose file and featuresConfig from persisted storage.
 	// This file may have been generated upon a Codespace creation.
@@ -403,13 +408,16 @@ async function startContainer(params: DockerResolverParameters, buildParams: Doc
 		let cache: Promise<ImageDetails> | undefined;
 		const imageDetails = () => cache || (cache = inspectDockerImage(params, currentImageName, true));
 		const mergedConfig = mergeConfiguration(config, imageMetadata.config);
-		const updatedImageName = noBuild ? currentImageName : await updateRemoteUserUID(params, mergedConfig, currentImageName, imageDetails, service.user);
+		const bridgeResult = await prepareBridge(params, mergedConfig);
+		bridge = bridgeResult.bridge;
+		const bridgeReadyMergedConfig = bridgeResult.mergedConfig;
+		const updatedImageName = noBuild ? currentImageName : await updateRemoteUserUID(params, bridgeReadyMergedConfig, currentImageName, imageDetails, service.user);
 
 		// Save override docker-compose file to disk.
 		// Persisted folder is a path that will be maintained between sessions
 		// Note: As a fallback, persistedFolder is set to the build's tmpDir() directory
 		const additionalLabels = labels ? idLabels.concat(Object.keys(labels).map(key => `${key}=${labels[key]}`)) : idLabels;
-		const overrideFilePath = await writeFeaturesComposeOverrideFile(updatedImageName, currentImageName, mergedConfig, config, versionPrefix, imageDetails, service, additionalLabels, params.additionalMounts, persistedFolder, featuresStartOverrideFilePrefix, buildCLIHost, params, output);
+		const overrideFilePath = await writeFeaturesComposeOverrideFile(updatedImageName, currentImageName, bridgeReadyMergedConfig, config, versionPrefix, imageDetails, service, additionalLabels.concat(bridgeLabels(bridge)), params.additionalMounts, persistedFolder, featuresStartOverrideFilePrefix, buildCLIHost, params, output);
 
 		if (overrideFilePath) {
 			// Add file path to override file as parameter
@@ -448,6 +456,7 @@ async function startContainer(params: DockerResolverParameters, buildParams: Doc
 	await started;
 	return {
 		containerId: (await findComposeContainer(params, projectName, config.service))!,
+		bridge,
 	};
 }
 

@@ -13,6 +13,7 @@ import { LogLevel, Log, makeLog } from '../spec-utils/log';
 import { extendImage, getExtendImageBuildInfo, updateRemoteUserUID } from './containerFeatures';
 import { getDevcontainerMetadata, getImageBuildInfoFromDockerfile, getImageMetadataFromContainer, ImageMetadataEntry, lifecycleCommandOriginMapFromMetadata, mergeConfiguration, MergedDevContainerConfig } from './imageMetadata';
 import { ensureDockerfileHasFinalStageName, generateMountCommand } from './dockerfileUtils';
+import { bridgeLabels, prepareBridge, startBridge, BridgeSession } from '../spec-bridge/bridge';
 
 export const hostFolderLabel = 'devcontainer.local_folder'; // used to label containers created from a workspace/folder
 export const configFileLabel = 'devcontainer.config_file';
@@ -29,6 +30,7 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 		container = await findExistingContainer(params, idLabels);
 		let imageMetadata: ImageMetadataEntry[];
 		let mergedConfig: MergedDevContainerConfig;
+		let bridge: BridgeSession | undefined;
 		if (container) {
 			// let _collapsedFeatureConfig: Promise<CollapsedFeaturesConfig | undefined>;
 			// collapsedFeaturesConfig = async () => {
@@ -45,13 +47,16 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 			const res = await buildNamedImageAndExtend(params, configWithRaw, additionalFeatures, true);
 			imageMetadata = res.imageMetadata.config;
 			mergedConfig = mergeConfiguration(config, imageMetadata);
+			const bridgeResult = await prepareBridge(params, mergedConfig);
+			bridge = bridgeResult.bridge;
+			mergedConfig = bridgeResult.mergedConfig;
 			const { containerUser } = mergedConfig;
 			const updatedImageName = await updateRemoteUserUID(params, mergedConfig, res.updatedImageName[0], res.imageDetails, findUserArg(config.runArgs) || containerUser);
 
 			// collapsedFeaturesConfig = async () => res.collapsedFeaturesConfig;
 
 			try {
-				await spawnDevContainer(params, config, mergedConfig, updatedImageName, idLabels, workspaceConfig.workspaceMount, workspaceConfig.additionalMountString, res.imageDetails, containerUser, res.labels || {});
+				await spawnDevContainer(params, config, mergedConfig, updatedImageName, idLabels.concat(bridgeLabels(bridge)), workspaceConfig.workspaceMount, workspaceConfig.additionalMountString, res.imageDetails, containerUser, res.labels || {});
 			} finally {
 				// In 'finally' because 'docker run' can fail after creating the container.
 				// Trying to get it here, so we can offer 'Rebuild Container' as an action later.
@@ -63,6 +68,7 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 		}
 
 		containerProperties = await createContainerProperties(params, container.Id, workspaceConfig.workspaceFolder, mergedConfig.remoteUser);
+		await startBridge(params, bridge, container.Id, container.Name);
 		return await setupContainer(container, params, containerProperties, config, mergedConfig, imageMetadata);
 
 	} catch (e) {
