@@ -45,7 +45,7 @@ import { featuresGenerateDocsHandler, featuresGenerateDocsOptions } from './feat
 import { templatesGenerateDocsHandler, templatesGenerateDocsOptions } from './templatesCLI/generateDocs';
 import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configuration/containerCollectionsOCI';
 import { templateMetadataHandler, templateMetadataOptions } from './templatesCLI/metadata';
-import { getBridgeDoctorReport, restoreBridge, runBridgeHostFromConfig, runBridgeSupervisorFromConfig } from '../spec-bridge/bridge';
+import { getBridgeDoctorReport, restoreBridgeFromContainer, runBridgeHostFromConfig, runBridgeSupervisorFromConfig } from '../spec-bridge/bridge';
 
 const defaultDefaultUserEnvProbe: UserEnvProbe = 'loginInteractiveShell';
 
@@ -86,10 +86,12 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 	y.command('set-up', 'Set up an existing container as a dev container', setUpOptions, setUpHandler);
 	y.command('build [path]', 'Build a dev container image', buildOptions, buildHandler);
 	y.command('run-user-commands', 'Run user commands', runUserCommandsOptions, runUserCommandsHandler);
-	y.command('doctor', 'Inspect devcontainer bridge health', doctorOptions, doctorHandler);
 	y.command('read-configuration', 'Read configuration', readConfigurationOptions, readConfigurationHandler);
 	y.command('outdated', 'Show current and available versions', outdatedOptions, outdatedHandler);
 	y.command('upgrade', 'Upgrade lockfile', featuresUpgradeOptions, featuresUpgradeHandler);
+	y.command('bridge', 'Bridge commands', (y: Argv) => {
+		y.command('doctor', 'Inspect bridge health', doctorOptions, doctorHandler);
+	});
 	y.command('features', 'Features commands', (y: Argv) => {
 		y.command('test [target]', 'Test Features', featuresTestOptions, featuresTestHandler);
 		y.command('package <target>', 'Package Features', featuresPackageOptions, featuresPackageHandler);
@@ -119,6 +121,7 @@ function doctorOptions(y: Argv) {
 		'container-data-folder': { type: 'string', description: 'Container data folder where user data inside the container will be stored.' },
 		'container-system-data-folder': { type: 'string', description: 'Container system data folder where system data inside the container will be stored.' },
 		'workspace-folder': { type: 'string', description: 'Workspace folder path.' },
+		'container-id': { type: 'string', description: 'Id of the container to inspect.' },
 		'config': { type: 'string', description: 'devcontainer.json path.' },
 		'id-label': { type: 'string', array: true, description: 'Filter by id label(s).' },
 		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level.' },
@@ -176,6 +179,7 @@ function provisionOptions(y: Argv) {
 		'omit-syntax-directive': { type: 'boolean', default: false, hidden: true, description: 'Omit Dockerfile syntax directives' },
 		'include-configuration': { type: 'boolean', default: false, description: 'Include configuration in result.' },
 		'include-merged-configuration': { type: 'boolean', default: false, description: 'Include merged configuration in result.' },
+		'bridge': { type: 'boolean', default: false, description: 'Enable macOS browser and localhost callback bridging for this container.' },
 	})
 		.check(argv => {
 			const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;
@@ -247,8 +251,9 @@ async function provision({
 	'experimental-lockfile': experimentalLockfile,
 	'experimental-frozen-lockfile': experimentalFrozenLockfile,
 	'omit-syntax-directive': omitSyntaxDirective,
-	'include-configuration': includeConfig,
-	'include-merged-configuration': includeMergedConfig,
+		'include-configuration': includeConfig,
+		'include-merged-configuration': includeMergedConfig,
+		'bridge': bridgeEnabled,
 }: ProvisionArgs) {
 
 	const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
@@ -320,6 +325,7 @@ async function provision({
 		omitSyntaxDirective,
 		includeConfig,
 		includeMergedConfig,
+		bridgeEnabled,
 	};
 
 	const result = await doProvision(options, providedIdLabels);
@@ -1383,7 +1389,7 @@ export async function doExec({
 			buildxOutput: undefined,
 			skipPostAttach: false,
 			skipPersistingCustomizationsFromFeatures: false,
-			dotfiles: {}
+			dotfiles: {},
 		}, disposables);
 
 		const { common } = params;
@@ -1449,6 +1455,7 @@ async function doDoctor({
 	'container-data-folder': containerDataFolder,
 	'container-system-data-folder': containerSystemDataFolder,
 	'workspace-folder': workspaceFolderArg,
+	'container-id': containerId,
 	'mount-workspace-git-root': mountWorkspaceGitRoot,
 	'mount-git-worktree-common-dir': mountGitWorktreeCommonDir,
 	'id-label': idLabel,
@@ -1502,17 +1509,17 @@ async function doDoctor({
 			buildxOutput: undefined,
 			skipPostAttach: false,
 			skipPersistingCustomizationsFromFeatures: false,
-			dotfiles: {}
+			dotfiles: {},
+			bridgeEnabled: true,
 		}, disposables);
 
 		output = params.common.output;
-		const workspace = workspaceFromPath(params.common.cliHost.path, workspaceFolder);
-		const configPath = configFile ? configFile : await getDevContainerConfigPathIn(params.common.cliHost, workspace.configFolderPath);
-		const { container } = await findContainerAndIdLabels(params, undefined, providedIdLabels, workspaceFolder, configPath?.fsPath);
+		const configPath = configFile ? configFile : await getDevContainerConfigPathIn(params.common.cliHost, workspaceFolder);
+		const { container } = await findContainerAndIdLabels(params, containerId, providedIdLabels, workspaceFolder, configPath?.fsPath);
 		if (!container) {
 			throw new ContainerError({ description: 'Dev container not found.' });
 		}
-		const bridge = await restoreBridge(params, container);
+		const bridge = await restoreBridgeFromContainer(container);
 		const report = await getBridgeDoctorReport(bridge);
 		if (!report) {
 			process.stdout.write('Bridge: not configured for this container\n');

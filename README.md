@@ -72,6 +72,7 @@ Commands:
   devcontainer build [path]         Build a dev container image
   devcontainer run-user-commands    Run user commands
   devcontainer read-configuration   Read configuration
+  devcontainer bridge               Bridge commands
   devcontainer features             Features commands
   devcontainer templates            Templates commands
   devcontainer exec <cmd> [args..]  Execute a command on a running dev container
@@ -168,6 +169,7 @@ You may review other resources part of the specification in the [`devcontainers`
 ### Documentation
 
 - Additional information on using the built-in [Features testing command](./docs/features/test.md).
+- Additional information on the opt-in macOS [bridge mode](./docs/bridge.md).
 
 ## Contributing
 

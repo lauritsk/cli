@@ -194,7 +194,7 @@ function mergeMounts(existing: (Mount | string)[] | undefined, mount: string): (
 
 export async function prepareBridge(params: DockerResolverParameters, mergedConfig: MergedDevContainerConfig): Promise<BridgePrepareResult> {
 	const { common } = params;
-	if (common.cliHost.platform !== 'darwin') {
+	if (common.cliHost.platform !== 'darwin' || !params.bridgeEnabled) {
 		return { bridge: undefined, mergedConfig };
 	}
 
@@ -252,9 +252,13 @@ function envListToObject(env: string[] | null | undefined): NodeJS.ProcessEnv {
 }
 
 export async function restoreBridge(params: DockerResolverParameters, container: { Config: { Env: string[] | null; Labels: Record<string, string | undefined> | null; }; Mounts: { Source: string; Destination: string; }[]; }): Promise<BridgeSession | undefined> {
-	if (params.common.cliHost.platform !== 'darwin') {
+	if (params.common.cliHost.platform !== 'darwin' || !params.bridgeEnabled) {
 		return undefined;
 	}
+	return restoreBridgeFromContainer(container);
+}
+
+export async function restoreBridgeFromContainer(container: { Config: { Env: string[] | null; Labels: Record<string, string | undefined> | null; }; Mounts: { Source: string; Destination: string; }[]; }): Promise<BridgeSession | undefined> {
 	const labels = container.Config.Labels || {};
 	if (labels[bridgeEnabledLabel] !== 'true') {
 		return undefined;

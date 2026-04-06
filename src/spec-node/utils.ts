@@ -117,6 +117,7 @@ export interface DockerResolverParameters {
 	mountGitWorktreeCommonDir: boolean;
 	updateRemoteUserUIDOnMacOS: boolean;
 	cacheMount: 'volume' | 'bind' | 'none';
+	bridgeEnabled?: boolean;
 	removeOnStartup?: boolean | string;
 	buildNoCache?: boolean;
 	expectExistingContainer?: boolean;

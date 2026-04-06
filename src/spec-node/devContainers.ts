@@ -74,6 +74,7 @@ export interface ProvisionOptions {
 	omitSyntaxDirective?: boolean;
 	includeConfig?: boolean;
 	includeMergedConfig?: boolean;
+	bridgeEnabled?: boolean;
 }
 
 export async function launch(options: ProvisionOptions, providedIdLabels: string[] | undefined, disposables: (() => Promise<unknown> | undefined)[]) {
@@ -253,6 +254,7 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		additionalLabels: options.additionalLabels,
 		buildxOutput: common.buildxOutput,
 		buildxCacheTo: common.buildxCacheTo,
+		bridgeEnabled: !!options.bridgeEnabled,
 		buildPlatformInfo,
 		targetPlatformInfo
 	};

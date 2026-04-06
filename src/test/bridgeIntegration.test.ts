@@ -30,13 +30,13 @@ describe('Internal bridge integration', function () {
 	it('forwards localhost auth callbacks on first start and container reuse', async () => {
 		let containerId: string | null = null;
 		try {
-			const firstUp = await devContainerUp(cli, testFolder, { env, logLevel: 'trace' });
+			const firstUp = await devContainerUp(cli, testFolder, { env, logLevel: 'trace', extraArgs: '--bridge' });
 			containerId = firstUp.containerId;
 			await runAuthDemo(containerId);
 
 			await devContainerStop({ containerId });
 
-			const resumed = await devContainerUp(cli, testFolder, { env, logLevel: 'trace' });
+			const resumed = await devContainerUp(cli, testFolder, { env, logLevel: 'trace', extraArgs: '--bridge' });
 			containerId = resumed.containerId;
 			await runAuthDemo(containerId);
 		} finally {
