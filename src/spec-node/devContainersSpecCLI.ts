@@ -89,8 +89,8 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 	y.command('read-configuration', 'Read configuration', readConfigurationOptions, readConfigurationHandler);
 	y.command('outdated', 'Show current and available versions', outdatedOptions, outdatedHandler);
 	y.command('upgrade', 'Upgrade lockfile', featuresUpgradeOptions, featuresUpgradeHandler);
-	y.command('bridge', 'Bridge commands', (y: Argv) => {
-		y.command('doctor', 'Inspect bridge health', doctorOptions, doctorHandler);
+	y.command('bridge', 'Browser auth bridge commands', (y: Argv) => {
+		y.command('doctor', 'Inspect browser auth bridge health', doctorOptions, doctorHandler);
 	});
 	y.command('features', 'Features commands', (y: Argv) => {
 		y.command('test [target]', 'Test Features', featuresTestOptions, featuresTestHandler);
@@ -179,7 +179,7 @@ function provisionOptions(y: Argv) {
 		'omit-syntax-directive': { type: 'boolean', default: false, hidden: true, description: 'Omit Dockerfile syntax directives' },
 		'include-configuration': { type: 'boolean', default: false, description: 'Include configuration in result.' },
 		'include-merged-configuration': { type: 'boolean', default: false, description: 'Include merged configuration in result.' },
-		'bridge': { type: 'boolean', default: false, description: 'Enable macOS browser and localhost callback bridging for this container.' },
+		'bridge': { type: 'boolean', default: false, description: 'Enable macOS browser and localhost auth callback assistance for this container. Use Docker networking for normal port publishing.' },
 	})
 		.check(argv => {
 			const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;

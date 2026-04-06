@@ -2,6 +2,15 @@
 
 The CLI can enable an internal macOS bridge for browser-based auth flows started inside devcontainers.
 
+## When to use it
+
+Use standard Docker networking first.
+
+- Use Docker `ports`, `forwardPorts`, or Compose networking when you want a stable service or application port exposed from the container.
+- Use the bridge when a tool inside the container needs to open the host browser or complete a localhost auth callback on macOS.
+
+The bridge is not a general replacement for Docker port publishing. It is an opt-in auth and browser convenience layer for development workflows.
+
 ## Enabling the bridge
 
 The bridge is opt-in.
@@ -22,6 +31,17 @@ Reopening a bridge-enabled container with `devcontainer up` also requires `--bri
 - rewrites browser-opened `localhost` URLs to the forwarded host port when an exact port cannot be claimed
 
 This is intended to make flows like OAuth callbacks work for tools running inside the container.
+
+## What it does not replace
+
+Use Docker-native networking for production-like and steady-state behavior:
+
+- published application ports
+- service-to-service communication between containers
+- Compose network topology
+- any port exposure you want to manage explicitly and predictably
+
+The bridge does not replace those features. It only helps with browser launch and localhost callback flows that are awkward to predeclare as fixed Docker port mappings.
 
 ## Security model
 
@@ -48,6 +68,8 @@ For the first case, the bridge can rewrite the URL before it reaches the host br
 
 For the second case, the host must actually be listening on the callback port. The bridge tries to bind the same host port first. If that host port is already busy, it falls back to another port, which means a manually copied `localhost:<port>` callback URL may not work as-is.
 
+If the callback port is known and stable ahead of time, prefer Docker port publishing instead of relying on the bridge.
+
 ## Bridge status
 
 Use:
@@ -72,3 +94,4 @@ This reports:
 - reused containers are supported, but existing non-bridge containers are not retrofitted
 - exact host port binding is best-effort; if the host port is occupied, the bridge falls back to another port
 - generic loopback forwarding still depends on `nc`, `python`, `python3`, or `bash` being available inside the container
+- intended for developer auth UX, not as a substitute for Docker's production-hardened networking model
