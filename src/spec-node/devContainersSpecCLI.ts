@@ -45,7 +45,7 @@ import { featuresGenerateDocsHandler, featuresGenerateDocsOptions } from './feat
 import { templatesGenerateDocsHandler, templatesGenerateDocsOptions } from './templatesCLI/generateDocs';
 import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configuration/containerCollectionsOCI';
 import { templateMetadataHandler, templateMetadataOptions } from './templatesCLI/metadata';
-import { runBridgeHostFromConfig, runBridgeSupervisorFromConfig } from '../spec-bridge/bridge';
+import { getBridgeDoctorReport, restoreBridge, runBridgeHostFromConfig, runBridgeSupervisorFromConfig } from '../spec-bridge/bridge';
 
 const defaultDefaultUserEnvProbe: UserEnvProbe = 'loginInteractiveShell';
 
@@ -86,6 +86,7 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 	y.command('set-up', 'Set up an existing container as a dev container', setUpOptions, setUpHandler);
 	y.command('build [path]', 'Build a dev container image', buildOptions, buildHandler);
 	y.command('run-user-commands', 'Run user commands', runUserCommandsOptions, runUserCommandsHandler);
+	y.command('doctor', 'Inspect devcontainer bridge health', doctorOptions, doctorHandler);
 	y.command('read-configuration', 'Read configuration', readConfigurationOptions, readConfigurationHandler);
 	y.command('outdated', 'Show current and available versions', outdatedOptions, outdatedHandler);
 	y.command('upgrade', 'Upgrade lockfile', featuresUpgradeOptions, featuresUpgradeHandler);
@@ -110,6 +111,24 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 })().catch(console.error);
 
 export type UnpackArgv<T> = T extends Argv<infer U> ? U : T;
+
+function doctorOptions(y: Argv) {
+	return y.options({
+		'docker-path': { type: 'string', description: 'Docker CLI path.' },
+		'docker-compose-path': { type: 'string', description: 'Docker Compose CLI path.' },
+		'container-data-folder': { type: 'string', description: 'Container data folder where user data inside the container will be stored.' },
+		'container-system-data-folder': { type: 'string', description: 'Container system data folder where system data inside the container will be stored.' },
+		'workspace-folder': { type: 'string', description: 'Workspace folder path.' },
+		'config': { type: 'string', description: 'devcontainer.json path.' },
+		'id-label': { type: 'string', array: true, description: 'Filter by id label(s).' },
+		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level.' },
+		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
+		'mount-workspace-git-root': { type: 'boolean', default: true, description: 'Mount the workspace using its Git root.' },
+		'mount-git-worktree-common-dir': { type: 'boolean', default: false, description: 'Mount the Git worktree common dir.' },
+	});
+}
+
+type DoctorArgs = UnpackArgv<ReturnType<typeof doctorOptions>>;
 
 function provisionOptions(y: Argv) {
 	return y.options({
@@ -1280,6 +1299,10 @@ function execHandler(args: ExecArgs) {
 	runAsyncHandler(exec.bind(null, args));
 }
 
+function doctorHandler(args: DoctorArgs) {
+	runAsyncHandler(doctor.bind(null, args));
+}
+
 async function exec(args: ExecArgs) {
 	const result = await doExec(args);
 	const exitCode = typeof result.code === 'number' && (result.code || !result.signal) ? result.code :
@@ -1411,6 +1434,119 @@ export async function doExec({
 			signal: err?.signal as string | number | undefined,
 			dispose,
 		};
+	}
+}
+
+async function doctor(args: DoctorArgs) {
+	const result = await doDoctor(args);
+	await result.dispose();
+	process.exit(result.code || 0);
+}
+
+async function doDoctor({
+	'docker-path': dockerPath,
+	'docker-compose-path': dockerComposePath,
+	'container-data-folder': containerDataFolder,
+	'container-system-data-folder': containerSystemDataFolder,
+	'workspace-folder': workspaceFolderArg,
+	'mount-workspace-git-root': mountWorkspaceGitRoot,
+	'mount-git-worktree-common-dir': mountGitWorktreeCommonDir,
+	'id-label': idLabel,
+	config: configParam,
+	'log-level': logLevel,
+	'log-format': logFormat,
+}: DoctorArgs) {
+	const disposables: (() => Promise<unknown> | undefined)[] = [];
+	const dispose = async () => {
+		await Promise.all(disposables.map(d => d()));
+	};
+	let output: Log | undefined;
+	try {
+		const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : process.cwd();
+		const providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
+		const configFile = configParam ? URI.file(path.resolve(process.cwd(), configParam)) : undefined;
+		const params = await createDockerParams({
+			dockerPath,
+			dockerComposePath,
+			containerDataFolder,
+			containerSystemDataFolder,
+			workspaceFolder,
+			mountWorkspaceGitRoot,
+			mountGitWorktreeCommonDir,
+			configFile,
+			overrideConfigFile: undefined,
+			logLevel: mapLogLevel(logLevel),
+			logFormat,
+			log: text => process.stderr.write(text),
+			terminalDimensions: undefined,
+			onDidChangeTerminalDimensions: undefined,
+			defaultUserEnvProbe: defaultDefaultUserEnvProbe,
+			removeExistingContainer: false,
+			buildNoCache: false,
+			expectExistingContainer: false,
+			postCreateEnabled: true,
+			skipNonBlocking: false,
+			prebuild: false,
+			persistedFolder: undefined,
+			additionalMounts: [],
+			updateRemoteUserUIDDefault: 'never',
+			remoteEnv: {},
+			additionalCacheFroms: [],
+			useBuildKit: 'auto',
+			omitLoggerHeader: true,
+			buildxPlatform: undefined,
+			buildxPush: false,
+			additionalLabels: [],
+			buildxCacheTo: undefined,
+			skipFeatureAutoMapping: false,
+			buildxOutput: undefined,
+			skipPostAttach: false,
+			skipPersistingCustomizationsFromFeatures: false,
+			dotfiles: {}
+		}, disposables);
+
+		output = params.common.output;
+		const workspace = workspaceFromPath(params.common.cliHost.path, workspaceFolder);
+		const configPath = configFile ? configFile : await getDevContainerConfigPathIn(params.common.cliHost, workspace.configFolderPath);
+		const { container } = await findContainerAndIdLabels(params, undefined, providedIdLabels, workspaceFolder, configPath?.fsPath);
+		if (!container) {
+			throw new ContainerError({ description: 'Dev container not found.' });
+		}
+		const bridge = await restoreBridge(params, container);
+		const report = await getBridgeDoctorReport(bridge);
+		if (!report) {
+			process.stdout.write('Bridge: not configured for this container\n');
+			return { code: 0, dispose };
+		}
+
+		const rows = [
+			['Bridge session', report.sessionId],
+			['Container id', report.containerId || container.Id],
+			['Supervisor pid', report.supervisorPid ? String(report.supervisorPid) : 'missing'],
+			['Supervisor running', report.supervisorRunning ? 'yes' : 'no'],
+			['Control port', String(report.controlPort)],
+			['Status file', report.statusPath],
+			['Last event', report.lastEvent || 'unknown'],
+			['Last error', report.lastError || 'none'],
+			['Updated at', report.updatedAt || 'unknown'],
+		];
+		process.stdout.write(`${textTable(rows)}\n`);
+		if (!report.forwarded.length) {
+			process.stdout.write('Forwarded ports: none yet\n');
+		} else {
+			process.stdout.write('Forwarded ports:\n');
+			for (const forward of report.forwarded) {
+				process.stdout.write(`- ${forward.containerPort} -> ${forward.hostPort}${forward.exactPort ? ' (exact)' : ' (fallback)'}\n`);
+			}
+		}
+		return { code: report.supervisorRunning ? 0 : 1, dispose };
+	} catch (err) {
+		if (output) {
+			output.write(err?.stack || err?.message || String(err), LogLevel.Error);
+		} else {
+			console.error(err?.stack || err?.message || String(err));
+		}
+		return { code: 1, dispose };
 	}
 }
 

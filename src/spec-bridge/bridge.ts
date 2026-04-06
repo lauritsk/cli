@@ -29,6 +29,7 @@ export interface BridgeSession {
 	token: string;
 	configPath: string;
 	pidPath: string;
+	statusPath: string;
 	hostMountPath: string;
 	containerMountPath: string;
 }
@@ -43,6 +44,40 @@ interface BridgeConfigFile {
 	containerHostname: string;
 	sessionDir: string;
 	pidPath: string;
+	statusPath: string;
+}
+
+interface BridgeForwardStatus {
+	containerPort: number;
+	hostPort: number;
+	exactPort: boolean;
+}
+
+interface BridgeStatusFile {
+	sessionId: string;
+	containerId: string;
+	controlPort: number;
+	supervisorPid?: number;
+	hostPid?: number;
+	forwarded: BridgeForwardStatus[];
+	lastForwardedPort?: number;
+	lastExactPort?: boolean;
+	lastEvent?: string;
+	lastError?: string;
+	updatedAt: string;
+}
+
+export interface BridgeDoctorReport {
+	sessionId: string;
+	containerId: string;
+	controlPort: number;
+	supervisorPid?: number;
+	supervisorRunning: boolean;
+	statusPath: string;
+	forwarded: BridgeForwardStatus[];
+	lastEvent?: string;
+	lastError?: string;
+	updatedAt?: string;
 }
 
 interface BridgePrepareResult {
@@ -73,6 +108,44 @@ async function ensureDir(dir: string) {
 async function writeExecutable(filePath: string, content: string) {
 	await fs.promises.writeFile(filePath, content, { mode: 0o755 });
 	await fs.promises.chmod(filePath, 0o755);
+}
+
+async function readStatus(statusPath: string): Promise<BridgeStatusFile | undefined> {
+	try {
+		return JSON.parse(await fs.promises.readFile(statusPath, 'utf8')) as BridgeStatusFile;
+	} catch {
+		return undefined;
+	}
+}
+
+async function writeStatus(statusPath: string, update: Partial<BridgeStatusFile> & Pick<BridgeStatusFile, 'sessionId' | 'containerId' | 'controlPort'>) {
+	const current = await readStatus(statusPath);
+	const next: BridgeStatusFile = {
+		sessionId: update.sessionId,
+		containerId: update.containerId,
+		controlPort: update.controlPort,
+		supervisorPid: update.supervisorPid ?? current?.supervisorPid,
+		hostPid: update.hostPid ?? current?.hostPid,
+		forwarded: update.forwarded ?? current?.forwarded ?? [],
+		lastForwardedPort: update.lastForwardedPort ?? current?.lastForwardedPort,
+		lastExactPort: update.lastExactPort ?? current?.lastExactPort,
+		lastEvent: update.lastEvent ?? current?.lastEvent,
+		lastError: update.lastError ?? current?.lastError,
+		updatedAt: new Date().toISOString(),
+	};
+	await fs.promises.writeFile(statusPath, JSON.stringify(next, null, 2));
+}
+
+function isPidRunning(pid: number | undefined) {
+	if (!pid || pid <= 0) {
+		return false;
+	}
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function createOpenShim() {
@@ -140,6 +213,7 @@ export async function prepareBridge(params: DockerResolverParameters, mergedConf
 		token,
 		configPath: path.join(sessionDir, 'bridge-config.json'),
 		pidPath: path.join(sessionDir, 'bridge.pid'),
+		statusPath: path.join(sessionDir, 'bridge-status.json'),
 		hostMountPath: sessionDir,
 		containerMountPath: containerBridgeRoot,
 	};
@@ -202,6 +276,7 @@ export async function restoreBridge(params: DockerResolverParameters, container:
 		token,
 		configPath: path.join(mount.Source, 'bridge-config.json'),
 		pidPath: path.join(mount.Source, 'bridge.pid'),
+		statusPath: path.join(mount.Source, 'bridge-status.json'),
 		hostMountPath: mount.Source,
 		containerMountPath: containerBridgeRoot,
 	};
@@ -276,8 +351,17 @@ export async function startBridge(params: DockerResolverParameters, bridge: Brid
 		containerHostname,
 		sessionDir: bridge.hostMountPath,
 		pidPath: bridge.pidPath,
+		statusPath: bridge.statusPath,
 	};
 	await fs.promises.writeFile(bridge.configPath, JSON.stringify(config));
+	await writeStatus(bridge.statusPath, {
+		sessionId: bridge.sessionId,
+		containerId,
+		controlPort: bridge.port,
+		lastEvent: 'bridge starting',
+		lastError: undefined,
+		forwarded: [],
+	});
 
 	const cliEntry = path.join(params.common.extensionPath, 'devcontainer.js');
 	const child = spawn(process.execPath, [cliEntry, 'bridge-supervisor', '--config', bridge.configPath], {
@@ -350,6 +434,14 @@ class BridgeHostService {
 	}
 
 	async run() {
+		await writeStatus(this.config.statusPath, {
+			sessionId: path.basename(this.config.sessionDir),
+			containerId: this.config.containerId,
+			controlPort: this.config.controlPort,
+			hostPid: process.pid,
+			lastEvent: 'bridge host started',
+			lastError: undefined,
+		});
 		await new Promise<void>((resolve, reject) => {
 			this.controlServer.once('error', reject);
 			this.controlServer.listen(this.config.controlPort, '0.0.0.0', () => resolve());
@@ -387,6 +479,13 @@ class BridgeHostService {
 			res.statusCode = 204;
 			res.end();
 		} catch {
+			await writeStatus(this.config.statusPath, {
+				sessionId: path.basename(this.config.sessionDir),
+				containerId: this.config.containerId,
+				controlPort: this.config.controlPort,
+				lastEvent: 'browser open failed',
+				lastError: 'Failed to process /open request',
+			});
 			res.statusCode = 500;
 			res.end();
 		}
@@ -420,6 +519,13 @@ class BridgeHostService {
 			try {
 				await this.ensureForward(port);
 			} catch {
+				await writeStatus(this.config.statusPath, {
+					sessionId: path.basename(this.config.sessionDir),
+					containerId: this.config.containerId,
+					controlPort: this.config.controlPort,
+					lastEvent: `failed to forward ${port}`,
+					lastError: `Failed to forward container port ${port}`,
+				});
 				// Ignore single-port failures so the bridge can keep serving others.
 			}
 		}
@@ -455,6 +561,20 @@ class BridgeHostService {
 			listen(port);
 		});
 		this.forwarded.set(port, { server, hostPort });
+		await writeStatus(this.config.statusPath, {
+			sessionId: path.basename(this.config.sessionDir),
+			containerId: this.config.containerId,
+			controlPort: this.config.controlPort,
+			forwarded: [...this.forwarded.entries()].map(([containerPort, forward]) => ({
+				containerPort,
+				hostPort: forward.hostPort,
+				exactPort: containerPort === forward.hostPort,
+			})).sort((a, b) => a.containerPort - b.containerPort),
+			lastForwardedPort: port,
+			lastExactPort: port === hostPort,
+			lastEvent: port === hostPort ? `forwarded ${port} on exact host port` : `forwarded ${port} on host port ${hostPort}`,
+			lastError: undefined,
+		});
 		return hostPort;
 	}
 
@@ -507,6 +627,13 @@ class BridgeHostService {
 		}
 		this.forwarded.clear();
 		this.controlServer.close();
+		await writeStatus(this.config.statusPath, {
+			sessionId: path.basename(this.config.sessionDir),
+			containerId: this.config.containerId,
+			controlPort: this.config.controlPort,
+			hostPid: undefined,
+			lastEvent: 'bridge host stopped',
+		});
 	}
 }
 
@@ -520,6 +647,14 @@ export async function runBridgeHostFromConfig(configPath: string) {
 export async function runBridgeSupervisorFromConfig(configPath: string) {
 	const config = await readConfig(configPath);
 	await fs.promises.writeFile(config.pidPath, `${process.pid}`);
+	await writeStatus(config.statusPath, {
+		sessionId: path.basename(config.sessionDir),
+		containerId: config.containerId,
+		controlPort: config.controlPort,
+		supervisorPid: process.pid,
+		lastEvent: 'bridge supervisor started',
+		lastError: undefined,
+	});
 	let child: ReturnType<typeof spawn> | undefined;
 	let stopping = false;
 	const stopChild = () => {
@@ -533,6 +668,13 @@ export async function runBridgeSupervisorFromConfig(configPath: string) {
 		}
 		stopping = true;
 		stopChild();
+		await writeStatus(config.statusPath, {
+			sessionId: path.basename(config.sessionDir),
+			containerId: config.containerId,
+			controlPort: config.controlPort,
+			supervisorPid: undefined,
+			lastEvent: 'bridge supervisor stopped',
+		});
 		await fs.promises.rm(config.pidPath, { force: true });
 		process.exit(0);
 	};
@@ -541,6 +683,12 @@ export async function runBridgeSupervisorFromConfig(configPath: string) {
 
 	while (!stopping) {
 		if (!(await isContainerRunning(config))) {
+			await writeStatus(config.statusPath, {
+				sessionId: path.basename(config.sessionDir),
+				containerId: config.containerId,
+				controlPort: config.controlPort,
+				lastEvent: 'container stopped; supervisor exiting',
+			});
 			await shutdown();
 			return;
 		}
@@ -558,11 +706,51 @@ export async function runBridgeSupervisorFromConfig(configPath: string) {
 			break;
 		}
 		if (!(await isContainerRunning(config))) {
+			await writeStatus(config.statusPath, {
+				sessionId: path.basename(config.sessionDir),
+				containerId: config.containerId,
+				controlPort: config.controlPort,
+				lastEvent: 'container stopped after bridge exit',
+			});
 			await shutdown();
 			return;
 		}
+		await writeStatus(config.statusPath, {
+			sessionId: path.basename(config.sessionDir),
+			containerId: config.containerId,
+			controlPort: config.controlPort,
+			lastEvent: exitCode === 0 ? 'bridge host exited cleanly; restarting' : `bridge host exited with code ${exitCode}; restarting`,
+			lastError: exitCode === 0 ? undefined : `bridge host exited with code ${exitCode}`,
+		});
 		await new Promise(resolve => setTimeout(resolve, exitCode === 0 ? 250 : 1000));
 	}
+}
+
+export async function getBridgeDoctorReport(bridge: BridgeSession | undefined): Promise<BridgeDoctorReport | undefined> {
+	if (!bridge) {
+		return undefined;
+	}
+	const status = await readStatus(bridge.statusPath);
+	const supervisorPid = status?.supervisorPid ?? (async () => {
+		try {
+			return Number((await fs.promises.readFile(bridge.pidPath, 'utf8')).trim());
+		} catch {
+			return undefined;
+		}
+	})();
+	const resolvedSupervisorPid = typeof supervisorPid === 'number' ? supervisorPid : await supervisorPid;
+	return {
+		sessionId: bridge.sessionId,
+		containerId: status?.containerId || '',
+		controlPort: status?.controlPort || bridge.port,
+		supervisorPid: resolvedSupervisorPid,
+		supervisorRunning: isPidRunning(resolvedSupervisorPid),
+		statusPath: bridge.statusPath,
+		forwarded: status?.forwarded || [],
+		lastEvent: status?.lastEvent,
+		lastError: status?.lastError,
+		updatedAt: status?.updatedAt,
+	};
 }
 
 export function bridgeLabels(session: BridgeSession | undefined): string[] {

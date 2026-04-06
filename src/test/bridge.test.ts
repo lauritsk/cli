@@ -4,8 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as assert from 'assert';
+import { createRequire } from 'module';
 
-import { bridgeLabels, parseListeningPorts } from '../spec-bridge/bridge';
+const require = createRequire(import.meta.url);
+const { bridgeLabels, parseListeningPorts } = require('../spec-bridge/bridge') as typeof import('../spec-bridge/bridge');
 
 describe('Internal bridge', () => {
 	it('parses listening ports from proc net tables', () => {
